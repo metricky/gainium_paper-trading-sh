@@ -2,6 +2,7 @@ import {
   AllPricesResponse,
   BaseReturn,
   CandleResponse,
+  FundingRateResponse,
   ExchangeEnum,
   ExchangeInfo,
   ExchangeIntervals,
@@ -75,7 +76,7 @@ export class ExchangeService {
       Logger.warn(`${symbol} not found in DB`)
       symbolData = await this.getExchange(exchange).getExchangeInfo(symbol)
     }
-    if (!symbolData) {
+    if (!symbolData || !symbolData.data) {
       throw new HttpException('Symbol not found', 400)
     }
     return symbolData.data
@@ -144,6 +145,21 @@ export class ExchangeService {
       from,
       to,
       count,
+    )
+  }
+
+  getFundingRateHistory(
+    exchange: ExchangeEnum,
+    symbol: string,
+    from?: number,
+    to?: number,
+    limit?: number,
+  ): Promise<BaseReturn<FundingRateResponse[]>> {
+    return this.getExchange(exchange).getFundingRateHistory(
+      symbol,
+      from,
+      to,
+      limit,
     )
   }
 
