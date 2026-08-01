@@ -78,6 +78,14 @@ const UpdateOrderMutex = new IdMutex()
 const TickerMutex = new IdMutex()
 const commonMutex = new IdMutex()
 
+// Cancelling an order that is already gone (filled / cancelled / expired) is an
+// EXPECTED outcome of the liquidation sweep, not a failure: closeFuturePosition
+// cancels the user's reduceOnly orders symbol-wide, so concurrent liquidations
+// on the same symbol routinely race for the same order. `processCancelOrder`
+// reports it with this exact message — main-app's `unknownOrderMessages` list
+// matches on that string, so it must not change.
+const alreadyGoneOrderMessages = ['Unknown order']
+
 export class OrderService implements OnModuleInit {
   private redisClient: RedisWrapper | null = null
   private readonly watchSymbols: Map<string, Set<string>> = new Map()
@@ -89,6 +97,8 @@ export class OrderService implements OnModuleInit {
   private symbolsMap: Map<string, { data: ExchangeInfo; time: number }> =
     new Map()
   private codePairMap: Map<string, string> = new Map()
+  // uuids of positions whose liquidation is currently in flight
+  private liquidatingPositions: Set<string> = new Set()
   private newDataLimit = 30 * 1000
   constructor(
     @InjectModel(Order.name) private orderModel: Model<OrderDocument>,
@@ -1131,10 +1141,7 @@ export class OrderService implements OnModuleInit {
         positionSide: order.positionSide,
       }
     }
-    const orderInDb = await this.orderModel.create(orderData)
-    if (isFutures(order.exchange)) {
-      await this.processFuturesPosition(orderInDb, leverage, symbol)
-    } else {
+    if (!isFutures(order.exchange)) {
       const balance: { asset: string; free: number; locked: number }[] = []
       if (order.side === 'SELL') {
         balance.push(
@@ -1163,7 +1170,16 @@ export class OrderService implements OnModuleInit {
           },
         )
       }
-      await this.updateBalance(user.id, ...balance)
+      // Settle before booking the fill: the sold asset is debited first, and if
+      // the wallet cannot cover it the bought asset is never credited, so the
+      // order is rejected rather than filled out of money that isn't there.
+      if (!(await this.updateBalance(user.id, ...balance))) {
+        throw new HttpException('Not enough balance', 400)
+      }
+    }
+    const orderInDb = await this.orderModel.create(orderData)
+    if (isFutures(order.exchange)) {
+      await this.processFuturesPosition(orderInDb, leverage, symbol)
     }
     this.userGateway.sendOrderToClient(
       user.id,
@@ -1436,7 +1452,19 @@ export class OrderService implements OnModuleInit {
             this.addPositionToWatchList(position)
           }
         } else {
-          current.margin -= margin
+          // Release the margin that was actually LOCKED for these units, i.e.
+          // priced at the position's entry price — the same way `diffMargin`
+          // is derived in the flip branch above. Pricing the release at the
+          // closing order's price instead makes both `current.margin` and the
+          // wallet's `locked` drift by the trade's gross PnL on every partial
+          // close, which over time drives margin negative and locked to 0, and
+          // then every further release trips the wallet over-release guard.
+          const closedMargin = isCoinm(order.exchange)
+            ? (order.amount * symbol.quoteAsset.minAmount) /
+              current.entryPrice /
+              leverage
+            : (order.amount * current.entryPrice) / leverage
+          current.margin -= closedMargin
           current.positionAmt -= order.amount
           const profit = isCoinm(order.exchange)
             ? ((order.amount * symbol.quoteAsset.minAmount) /
@@ -1449,8 +1477,8 @@ export class OrderService implements OnModuleInit {
               order.fee
           current.profit += profit
           current.fee += order.fee
-          locked = -margin
-          free = margin + profit
+          locked = -closedMargin
+          free = closedMargin + profit
         }
       }
       if (current.status === PositionStatus.closed) {
@@ -1475,26 +1503,34 @@ export class OrderService implements OnModuleInit {
     })
   }
 
+  /** Returns false when the wallet could not cover the whole delta set. */
   private async updateBalance(
     user: Schema.Types.ObjectId | Types.ObjectId,
     ...data: { asset: string; free: number; locked: number }[]
-  ) {
+  ): Promise<boolean> {
     if (!data.length) {
-      return
+      return true
     }
-    await this.userService.increaseUserBalance(user, ...data).then(async () => {
-      try {
-        this.userGateway.sendBalanceToClient(
+    const applied = await this.userService.increaseUserBalance(user, ...data)
+    if (!applied) {
+      Logger.error(
+        `Balance update was not fully applied, user - ${user}, updates - ${JSON.stringify(
+          data,
+        )}`,
+      )
+    }
+    try {
+      this.userGateway.sendBalanceToClient(
+        user.toString(),
+        await this.userService.getUserBalanceByUserIdOrThrow(
           user.toString(),
-          await this.userService.getUserBalanceByUserIdOrThrow(
-            user.toString(),
-            data.map((d) => d.asset),
-          ),
-        )
-      } catch (e) {
-        Logger.error(`${e.message}`)
-      }
-    })
+          data.map((d) => d.asset),
+        ),
+      )
+    } catch (e) {
+      Logger.error(`${e.message}`)
+    }
+    return applied
   }
 
   checkRedis(sym: string) {
@@ -1611,7 +1647,16 @@ export class OrderService implements OnModuleInit {
           user.secret,
           o.externalId,
           true,
-        ).catch((e) => Logger.error(e))
+        ).catch((e) => {
+          const msg = `${(e as Error)?.message ?? e}`
+          if (alreadyGoneOrderMessages.some((m) => msg.includes(m))) {
+            Logger.debug(
+              `Reduce order ${o.externalId} already gone while liquidating ${position.uuid}: ${msg}`,
+            )
+            return
+          }
+          Logger.error(e)
+        })
       }
 
       const orderData: CreateOrderDto = {
@@ -1900,7 +1945,18 @@ export class OrderService implements OnModuleInit {
         .sort((a, b) => b.liquidationPrice - a.liquidationPrice)
 
       for (const position of [...longPositions, ...shortPositions]) {
-        this.closeFuturePosition(position)
+        // A liquidation spans several awaits (exchange info + cancel sweep +
+        // market order). The position stays NEW in RAM for that whole window,
+        // so without this guard every tick that arrives meanwhile queues
+        // another full pass for the same position on commonMutex and replays
+        // the cancel sweep.
+        if (this.liquidatingPositions.has(position.uuid)) {
+          continue
+        }
+        this.liquidatingPositions.add(position.uuid)
+        this.closeFuturePosition(position).finally(() =>
+          this.liquidatingPositions.delete(position.uuid),
+        )
       }
 
       const filterPositions = positions.filter((p) => p.symbol === symbol)
