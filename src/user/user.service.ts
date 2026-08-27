@@ -41,15 +41,25 @@ export type UserBalanceResponse = {
 }
 
 /**
- * `applied`   — the delta landed in full.
- * `contained` — it asked to release more than the wallet held, the clamp took
- *               the excess back off the credit side and the corrected write
- *               landed, so the ledger is still consistent with the position it
- *               backs. Not a full apply, but nothing was lost or minted.
- * `failed`    — nothing landed, or part of the delta set was skipped: the
- *               wallet may now disagree with the open orders.
+ * `applied`      — the delta landed in full.
+ * `contained`    — it asked to release more than the wallet held, the clamp
+ *                  took the excess back off the credit side and the corrected
+ *                  write landed, so the ledger is still consistent with the
+ *                  position it backs. Not a full apply, but nothing was lost
+ *                  or minted.
+ * `insufficient` — the wallet does not hold enough free balance to cover the
+ *                  debit. NOTHING was written, so the ledger is exactly where
+ *                  it started and the caller rejects the order the same way a
+ *                  real exchange would. An ordinary affordability rejection,
+ *                  not an accounting break.
+ * `failed`       — nothing landed, or part of the delta set was skipped: the
+ *                  wallet may now disagree with the open orders.
  */
-export type WalletDeltaResult = 'applied' | 'contained' | 'failed'
+export type WalletDeltaResult =
+  | 'applied'
+  | 'contained'
+  | 'insufficient'
+  | 'failed'
 
 export class UserService {
   constructor(
@@ -206,6 +216,17 @@ export class UserService {
     key: string,
     secret: string,
   ): Promise<UserDocument> {
+    // SECURITY: reject non-string credentials before they reach the query.
+    // These are typed `string` but the type is erased at runtime: Express' qs
+    // parser turns `key[$gt]=` in a query string -- and a nested object in a
+    // JSON body -- into an object, which Mongoose forwards as MongoDB query
+    // operators. Without this guard,
+    //   { key: { $gt: '' }, secret: { $gt: '' } }
+    // matches the first user in the collection and bypasses authentication
+    // entirely. Every authenticated entry point converges on this method.
+    if (typeof key !== 'string' || typeof secret !== 'string') {
+      throw new HttpException('User not found', 400)
+    }
     const user = await this.userModel.findOne({ key, secret }).exec()
     if (!user) {
       throw new HttpException('User not found', 400)
@@ -287,12 +308,26 @@ export class UserService {
       return 'failed'
     }
     if (debited.includes('contained')) {
-      return credits.length ? 'failed' : 'contained'
+      // A contained debit already wrote its clamped pair, so anything the set
+      // still has to skip afterwards leaves the wallet inconsistent.
+      return credits.length || debited.includes('insufficient')
+        ? 'failed'
+        : 'contained'
+    }
+    if (debited.length && debited.every((r) => r === 'insufficient')) {
+      // Not one delta of the set was written, so the skipped credits cost
+      // nothing: the wallet is untouched and the caller just cannot afford the
+      // order. Reported apart from `failed` so it is not logged as a break.
+      return 'insufficient'
+    }
+    if (debited.includes('insufficient')) {
+      // One debit landed while another was refused — a genuine partial apply.
+      return 'failed'
     }
     const credited = await Promise.all(
       credits.map((u) => this.applyWalletDelta(user, u)),
     )
-    if (credited.includes('failed')) {
+    if (credited.includes('failed') || credited.includes('insufficient')) {
       return 'failed'
     }
     return credited.includes('contained') ? 'contained' : 'applied'
@@ -338,19 +373,33 @@ export class UserService {
     const shortFree = shortOf(wallet?.free ?? 0, u.free)
     const shortLocked = shortOf(wallet?.locked ?? 0, u.locked)
     const shortfall = shortFree + shortLocked
+    // The most either field may be decremented by is everything the wallet has.
+    const freeFloor = -Math.max(wallet?.free ?? 0, 0)
+    const lockedFloor = -Math.max(wallet?.locked ?? 0, 0)
     // Clamp each debit to what is actually there and take the same amount off
     // the credit side, so the applied pair never nets to more than was asked.
-    const free = u.free > 0 ? u.free - shortfall : u.free + shortFree
-    const locked = u.locked > 0 ? u.locked - shortfall : u.locked + shortLocked
+    // Clamp straight TO the floor rather than adding the shortfall back on:
+    // `u.locked + shortLocked` only approximates it, and on a release several
+    // times bigger than the lock the sum rounds a single ulp past the floor,
+    // which the exact `>=` below then rejects outright — refusing a release
+    // the wallet could in fact cover in full.
+    const free = u.free > 0 ? u.free - shortfall : Math.max(u.free, freeFloor)
+    const locked =
+      u.locked > 0 ? u.locked - shortfall : Math.max(u.locked, lockedFloor)
     const absorbed =
       free + locked <= u.free + u.locked - walletBalanceMin &&
-      free >= -Math.max(wallet?.free ?? 0, 0) &&
-      locked >= -Math.max(wallet?.locked ?? 0, 0)
+      free >= freeFloor &&
+      locked >= lockedFloor
     const applied =
-      absorbed &&
       // Nothing survived the clamp — a release against a lock that is not
-      // there is a no-op, and writing it would only create an empty wallet.
-      ((free === 0 && locked === 0) ||
+      // there removes nothing and adds nothing, so it is a no-op whatever the
+      // net check says, and writing it would only create an empty wallet. It
+      // has to be tested BEFORE `absorbed`, not under it: that check asks
+      // whether the clamp was taken back off a credit side, and a delta that
+      // credits nothing has none to take it off — its clamped pair necessarily
+      // nets above the requested one, so the no-op could never be reached.
+      (free === 0 && locked === 0) ||
+      (absorbed &&
         // The guarded $inc can never match a wallet doc that does not exist
         // yet, so the first write for this (user, asset) has to upsert. It
         // upserts the CLAMPED pair, which with nothing to take from is never
@@ -368,6 +417,18 @@ export class UserService {
     if (applied) {
       Logger.warn(message)
       return 'contained'
+    }
+    // Nothing was written either way, but the two reasons are different events.
+    // A shortfall entirely on the debited `free` side is just "the user cannot
+    // afford this order", which the caller turns into a 400 exactly as the real
+    // exchange does — it is not an over-release and must not page anyone. Only
+    // a `locked` release the wallet does not hold means the lock accounting
+    // itself has drifted, and that stays an error.
+    if (shortLocked === 0 && shortFree > 0) {
+      Logger.warn(
+        `Insufficient free balance, user - ${user}, asset - ${u.asset}, requested free - ${u.free}, locked - ${u.locked}, wallet free - ${wallet?.free ?? 0}, locked - ${wallet?.locked ?? 0}, short by - ${shortFree}`,
+      )
+      return 'insufficient'
     }
     Logger.error(message)
     return 'failed'
@@ -465,7 +526,10 @@ export class UserService {
     coinToTopUp: string,
   ) {
     const user = await this.getUserByKeyAndSecretOrThrow(key, secret)
-    if (usdtBalance < 0) {
+    // SECURITY (GHSA-5xf3-v5jf-jwrc): `NaN < 0` is false, so a NaN amount slid
+    // past a bare `< 0` check and `$inc` corrupted the wallet balance to NaN.
+    // Infinity would do the same. Require a real, finite, non-negative number.
+    if (!Number.isFinite(usdtBalance) || usdtBalance < 0) {
       throw new HttpException('Insufficient amount', 400)
     }
     await this.walletModel

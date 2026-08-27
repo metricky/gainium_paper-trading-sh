@@ -2,6 +2,23 @@
 All notable changes to this project will be documented in this file.  
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.7] - 2026-08-24
+### Security
+- `GET /user/verify` is rate limited. It answers "are these credentials valid?" as a clean boolean, with plaintext secrets behind it and no lockout anywhere, so guessing was unbounded (GHSA-5xf3-v5jf-jwrc). Default 30 requests per minute per source, which sits far above the legitimate caller — main-app verifying a paper connection — and far below a brute-force rate. Tune with `VERIFY_RATE_LIMIT` and `VERIFY_RATE_WINDOW_MS`. The limiter is deliberately dependency-free and bounds its own key table, so it cannot itself be turned into a memory-exhaustion vector.
+
+## [1.3.6] - 2026-08-21
+### Security
+- The listen interface is configurable via `APP_HOST`. The default is unchanged — all interfaces, the exact `listen(port)` call this service has always made — because under Docker this runs as its own container and the api/connector containers reach it over the compose network. A deployment where every client shares one host can now set `APP_HOST=127.0.0.1` and take the service off the network entirely, which is worth doing: callers are authenticated by an API key/secret pair with no rate limiting behind it.
+
+## [1.3.5] - 2026-08-21
+### Security
+- A wallet top-up with a non-finite amount is rejected instead of corrupting the balance. The guard was a bare `amount < 0`, and `NaN < 0` is false, so `NaN` slipped past it and `$inc` wrote the wallet's free balance to `NaN`. Reported as GHSA-5xf3-v5jf-jwrc.
+- Order lookups no longer return another tenant's order out of the in-memory cache. `GET /order` and `GET /order/{id}` authenticated the caller and then read a process-global cache keyed only by `(symbol, externalId)` or by order id — with no ownership check — returning that hit before the user-scoped database query ever ran. A cached order now goes only to its owner; anything else falls through to the query, which was already correctly scoped. Reported as GHSA-5xf3-v5jf-jwrc.
+
+## [1.3.4] - 2026-08-18
+### Security
+- Authentication now rejects non-string API credentials before they reach the database. `key` and `secret` are declared `string`, but that type is erased at runtime and the service installs no global `ValidationPipe`, so an object supplied in a query string or JSON body was forwarded into the Mongoose filter as MongoDB query operators — turning the exact-match credential lookup in `getUserByKeyAndSecretOrThrow` into a predicate that matched an arbitrary account. Since every authenticated entry point (user, order, and the WebSocket gateway) converges on that one method, this bypassed authentication for all of them. Reported as GHSA-8p69-9fjc-6g78.
+
 ## [1.3.3] - 2026-08-05
 ### Fixed
 - Paper futures: a liquidation now closes the position that was actually liquidated. The close re-derived its target from `(user, positionSide)`, so when a user held several same-side positions on one symbol every liquidation resolved to whichever came first — one closed, the rest stayed `NEW` with an untouched `positionAmt` and were re-liquidated on every following tick without end.
