@@ -38,7 +38,7 @@
     "uuid": "^13.0.0"
   },
   "overrides": {
-    "multer": "^2.2.0",
+    "multer": "^2.3.0",
     "brace-expansion@1": "^1.1.13",
     "brace-expansion@2": "^2.0.2"
   },
