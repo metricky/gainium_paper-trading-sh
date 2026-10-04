@@ -1,5 +1,5 @@
 import { InjectModel } from '@nestjs/mongoose'
-import { Model, Schema, Types } from 'mongoose'
+import { Model, Schema, Types, UpdateWriteOpResult } from 'mongoose'
 import {
   Order,
   OrderDataType,
@@ -25,6 +25,7 @@ import {
   Tick,
 } from '../exchange/types'
 import { isFutures, isCoinm } from '../exchange/utils'
+import { paperOrderFee } from './fees'
 import { UserGateway } from '../ws/user.gateway'
 import { IdMute, IdMutex } from '../utils/mutex'
 import {
@@ -71,6 +72,22 @@ export type CommonOrder = {
     tradeId: string
   }[]
   reduceOnly?: boolean
+  /**
+   * The fee actually charged for this order, mirroring the exchange-connector
+   * contract field for field so the simulated path and the live path stay one
+   * code path in main-app. Optional and additive, exactly as they are there.
+   *
+   * The simulator has always CHARGED a fee (`order.fee`, accrued across
+   * partial fills and debited from the paper wallet) and never REPORTED one,
+   * so a paper deal's cost was only ever main-app's `qty * price * rate`
+   * estimate. `feeAsset` and `feeBreakdown` are declared for contract parity —
+   * the simulator always charges in one side of the pair, so it sets `feeSide`
+   * — and exist so a consumer can be written against one shape.
+   */
+  feePaid?: string
+  feeSide?: 'base' | 'quote'
+  feeAsset?: string
+  feeBreakdown?: { asset: string; amount: string }[]
 }
 
 const CreateOrderMutex = new IdMutex()
@@ -85,6 +102,23 @@ const commonMutex = new IdMutex()
 // reports it with this exact message — main-app's `unknownOrderMessages` list
 // matches on that string, so it must not change.
 const alreadyGoneOrderMessages = ['Unknown order']
+
+/**
+ * True when the fill write found no order document to update, i.e. the row was
+ * deleted while the order was resting in `currentOrders`.
+ *
+ * main-app's paper cleanup deletes a paper account whole — orders, wallets and
+ * the paperUser row together (`clearNotUsedPaperData` on the every-minute
+ * free-inactive-user cron, and the paper reset behind "reset paper data").
+ * paper-trading is never told, so its in-RAM copy of the account's resting
+ * limit orders outlives the account and keeps matching against ticks.
+ *
+ * An UNACKNOWLEDGED write also reports `matchedCount: 0` even though it may
+ * well have matched, so require the acknowledgement before concluding the row
+ * is gone — otherwise a `w: 0` write would evict a live order.
+ */
+const orderRowIsGone = (res: UpdateWriteOpResult) =>
+  res?.acknowledged === true && res.matchedCount === 0
 
 export class OrderService implements OnModuleInit {
   private redisClient: RedisWrapper | null = null
@@ -384,6 +418,7 @@ export class OrderService implements OnModuleInit {
     // below, which is already scoped to `user.id`.
     if (orderInRam && `${orderInRam.user}` === `${user.id}`) {
       return {
+        ...paperOrderFee(orderInRam),
         symbol: orderInRam.symbol,
         orderId: orderInRam._id.toString(),
         clientOrderId: orderInRam.externalId,
@@ -409,6 +444,7 @@ export class OrderService implements OnModuleInit {
     }
 
     return {
+      ...paperOrderFee(order),
       symbol: order.symbol,
       orderId: order._id.toString(),
       clientOrderId: order.externalId,
@@ -474,6 +510,7 @@ export class OrderService implements OnModuleInit {
     const preparedOrders = []
     for (const order of orders) {
       preparedOrders.push({
+        ...paperOrderFee(order),
         symbol: order.symbol,
         orderId: order._id,
         clientOrderId: order.externalId,
@@ -509,6 +546,7 @@ export class OrderService implements OnModuleInit {
     // getOrderByKeySecretExternalIdAndSymbol above.
     if (orderInRam && `${orderInRam.user}` === `${user.id}`) {
       return {
+        ...paperOrderFee(orderInRam),
         symbol: orderInRam.symbol,
         orderId: orderInRam._id.toString(),
         clientOrderId: orderInRam.externalId,
@@ -533,6 +571,7 @@ export class OrderService implements OnModuleInit {
       throw new HttpException('Order not found', 400)
     }
     return {
+      ...paperOrderFee(order),
       symbol: order.symbol,
       orderId: order._id,
       clientOrderId: order.externalId,
@@ -1422,9 +1461,21 @@ export class OrderService implements OnModuleInit {
           }
         } else if (diff <= 0) {
           if (order.reduceOnly) {
-            order.fee -= isCoinm(order.exchange)
-              ? (Math.abs(diff) * symbol.quoteAsset.minAmount) / order.price
-              : Math.abs(diff) * feePerc
+            // Refund the fee for the units this clamp is about to drop. `diff`
+            // is a BASE quantity and `order.fee` is denominated in what the
+            // fill settles in, so the refund has to go through the same
+            // conversion the charge did — `* order.price` on linear,
+            // `* contractSize / order.price` on coin-m — and then through the
+            // rate. Applying only half of that (a bare quantity on linear, a
+            // bare notional on coin-m) leaves the order holding the fee for
+            // units it never closed when the asset is priced above 1, and
+            // refunds more than was ever charged when it is priced below 1,
+            // ending with a NEGATIVE fee that credits the paper wallet. The
+            // non-reduceOnly branch below derives the same number the same way.
+            order.fee -=
+              (isCoinm(order.exchange)
+                ? (Math.abs(diff) * symbol.quoteAsset.minAmount) / order.price
+                : Math.abs(diff) * order.price) * feePerc
             order.amount = current.positionAmt
             order.filledAmount = order.amount
             order.quoteAmount = order.amount * order.price
@@ -1786,6 +1837,9 @@ export class OrderService implements OnModuleInit {
       }
     }
     let isFilled = false
+    // Set by the fill write below when it matched no document — see
+    // `orderRowIsGone`.
+    let rowIsGone = false
     const feePerc = order.feePerc || this.getUserFee('maker', order.exchange)
     const futures = isFutures(order.exchange)
     if (
@@ -1835,7 +1889,11 @@ export class OrderService implements OnModuleInit {
             },
           )
           .exec()
-          .then(async () => {
+          .then(async (res) => {
+            if (orderRowIsGone(res)) {
+              rowIsGone = true
+              return
+            }
             this.userGateway.sendOrderToClient(order.user.toString(), order)
           }),
       )
@@ -1906,7 +1964,11 @@ export class OrderService implements OnModuleInit {
             },
           )
           .exec()
-          .then(async () => {
+          .then(async (res) => {
+            if (orderRowIsGone(res)) {
+              rowIsGone = true
+              return
+            }
             this.userGateway.sendOrderToClient(order.user.toString(), order)
           }),
       )
@@ -1930,6 +1992,22 @@ export class OrderService implements OnModuleInit {
       this.setOrder(order)
     }
     await Promise.all(queries)
+    if (rowIsGone) {
+      // The account this order belongs to was wiped under us, so there is
+      // nothing left to fill against and nobody to notify. Drop the stale RAM
+      // copy rather than leaving it to match every subsequent tick — a
+      // partially-filling order would otherwise re-fire forever, and a filling
+      // one falls through to a `getUserByIdOrThrow` that can only ever throw
+      // `User not found`.
+      sym = `${this.getPairCodeByPairNameAndExchange(order.symbol, order.exchange)}@${order.exchange}`
+      ;(this.watchSymbols.get(sym) ?? new Set()).delete(order.externalId)
+      if ((this.watchSymbols.get(sym) ?? new Set()).size === 0) {
+        this.watchSymbols.delete(sym)
+        this.unsubscribeRedis(sym)
+      }
+      this.removeOrder(order)
+      return
+    }
     if (isFilled) {
       sym = `${this.getPairCodeByPairNameAndExchange(order.symbol, order.exchange)}@${order.exchange}`
       ;(this.watchSymbols.get(sym) ?? new Set()).delete(order.externalId)
@@ -1954,8 +2032,10 @@ export class OrderService implements OnModuleInit {
             symbol,
           )
         } catch (e) {
+          // Carry the ids: the bare message is not attributable, so a burst of
+          // these cannot be traced to a user, an order or a single account.
           Logger.error(
-            `Catch error processing limit order ${(e as Error).message}`,
+            `Catch error processing limit order ${(e as Error).message}, order - ${order._id}, user - ${order.user}`,
           )
         }
       }

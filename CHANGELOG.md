@@ -2,13 +2,33 @@
 All notable changes to this project will be documented in this file.  
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.11] - 2026-09-08
+### Added
+- `PAPER_FEE_ASSET_SYMBOLS` (comma-separated) reports the listed symbols' fee as paid in a third asset (`PAPER_FEE_ASSET`, default `GNM`) instead of split onto `feeSide: base | quote` — for testing the platform's BNB/BGB/KCS-style discount-asset path without a real account that has one. The charged amount and wallet debit are unchanged; only the reported asset changes. Spec 004. Supersedes an earlier, unshipped `PAPER_ZERO_FEE_SYMBOLS` attempt at the same underlying need — a confirmed-zero fee has nowhere to land in the observed-fee contract (`hasObservedFee`/`observedFeeSplit` both gate on `amount > 0`, by design) and TP-quantity sizing never reads a fee amount for anything besides the third-asset check, so forcing 0% never could have changed TP sizing. The third-asset path is real, observed, and already the exact gate (`ordersFeeIsThirdAssetOnly`, spec 014/015) that skips the TP gross-up.
+
+## [1.3.10] - 2026-09-08
+### Fixed
+- `UserGateway.sendOrderToClient`'s socket.io `order` push now carries `feePaid`/`feeSide`, the same fields `paperOrderFee` has reported on the REST endpoints since 1.3.8. That push feeds main-app's live order-update stream — the path TP placement actually runs on — and every one of its 5 call sites had been passing the raw order (`fee`/`feePerc` only) instead. Fixed at the one place all five funnel through, so a filled paper order's fee now reaches main-app on both paths a real exchange's fee does. Spec 003; companion fixes in `websocket-connector-sh` (spec 004) and `main-app-sh` (spec 017) are required for the fee to actually reach main-app.
+
+## [1.3.9] - 2026-09-03
+### Added
+- CI now runs a real `npm test` (mocha) on every PR. `fees.spec.ts` was
+  previously a standalone ts-node script with no test runner — converted
+  to real mocha `describe`/`it`.
+
+## [1.3.8] - 2026-08-27
+### Added
+- **The simulated fee is now reported on the order**, as `feePaid` + `feeSide` on `CommonOrder`, keeping this service in lockstep with exchange-connector core 1.20.8, where every venue now records the fee it actually charged. The simulator has always CHARGED a fee — `order.fee`, accrued across partial fills and debited from the paper wallet — and never reported one, so a paper deal's cost reached main-app only as a `qty * price * rate` estimate. Reporting the number the simulation actually took lets the consumer treat the paper and live paths identically. `feeAsset` and `feeBreakdown` are declared for contract parity but unused here: the simulator always charges in one side of the pair.
+- `feeSide` restates, in one place, the rule the simulator already applies when it debits the wallet — inverse futures settle in the base coin, linear futures in the quote coin, and spot takes the fee out of the asset RECEIVED (base on a buy, quote on a sell). Covered by a standalone ts-node check (`src/order/fees.spec.ts`; this repo has no test runner), written against the debit each code path performs so the two cannot drift apart silently.
+- A zero fee is reported as NO fee rather than `feePaid: '0'`, matching the live connectors: an absent fee means "keep your estimate", and a `0` would teach a consumer that the fill was free.
+
 ## [1.3.7] - 2026-08-24
 ### Security
 - `GET /user/verify` is rate limited. It answers "are these credentials valid?" as a clean boolean, with plaintext secrets behind it and no lockout anywhere, so guessing was unbounded (GHSA-5xf3-v5jf-jwrc). Default 30 requests per minute per source, which sits far above the legitimate caller — main-app verifying a paper connection — and far below a brute-force rate. Tune with `VERIFY_RATE_LIMIT` and `VERIFY_RATE_WINDOW_MS`. The limiter is deliberately dependency-free and bounds its own key table, so it cannot itself be turned into a memory-exhaustion vector.
 
 ## [1.3.6] - 2026-08-21
 ### Security
-- The listen interface is configurable via `APP_HOST`. The default is unchanged — all interfaces, the exact `listen(port)` call this service has always made — because under Docker this runs as its own container and the api/connector containers reach it over the compose network. A deployment where every client shares one host can now set `APP_HOST=127.0.0.1` and take the service off the network entirely, which is worth doing: callers are authenticated by an API key/secret pair with no rate limiting behind it.
+- The listen interface is configurable via `APP_HOST`. The default is unchanged — all interfaces, the exact `listen(port)` call this service has always made — because under Docker this runs as its own container and the api/connector containers reach it over the compose network. A deployment where every client shares one host can now set `APP_HOST=127.0.0.1` and take the service off the network entirely, which is worth doing wherever that network exposure is not needed.
 
 ## [1.3.5] - 2026-08-21
 ### Security
